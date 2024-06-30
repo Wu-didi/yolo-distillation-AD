@@ -1,14 +1,15 @@
-from yolov5.detect_extract_feature import run,main,parse_opt
+from detect_extract_feature import get_features 
 
 
 
 
-def get_features():
-    opt = parse_opt()
-    features =  main(opt)
-    return features
+def teacher_features():
+    
+    
+    return get_features()
 
     
 
-
-print(get_features())
+result = teacher_features()
+print(len(result))
+# print(teacher_features())
