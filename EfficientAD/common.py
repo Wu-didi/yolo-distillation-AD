@@ -140,5 +140,5 @@ class student_model(nn.Module):
 if __name__ == '__main__':
     import torch
     model = student_model()
-    data = torch.rand(1, 3, 256, 256)
+    data = torch.rand(1, 3, 128, 128)
     print(model(data).shape)

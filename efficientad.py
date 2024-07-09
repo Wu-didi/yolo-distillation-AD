@@ -18,10 +18,10 @@ from sklearn.metrics import roc_auc_score
 from models.yolo import Model
 from utils.general import check_yaml
 from utils.torch_utils import select_device
-from utils.datasets import LoadImages
+from utils.datasets import LoadImages,LoadImagesForAD
 from models.experimental import attempt_load
 import torch.nn.functional as F
-
+import torch.nn as nn
 
 # 解析YOLO标注文件
 def parse_yolo_annotation(annotation_file):
@@ -37,12 +37,15 @@ def parse_yolo_annotation(annotation_file):
 
 
 # 过滤标签中的文件,返回true or false，如果是true,则忽略这个标签
-def is_ignore(x1,x2,y1,y2, threshold = 16):
+def is_ignore(x1,x2,y1,y2,img_w, img_h, threshold = 16):
     # 判断一下，如果x2-x1 或者 y2-y1 小于16, 则不进行裁剪,跳过这个边界框
     if x2 - x1 < threshold or y2 - y1 < threshold:
         return True
     # 保证都大于0，如果有一个小于的就跳过
-    if x1 < 0 or y1 < 0 or x2 < 0 or y2 < 0:
+    if x1 < 1 or y1 < 1 or x2 < 1 or y2 < 1:
+        return True
+    # 如果右下角的坐标超过了图像的边界，也跳过
+    if x2 > img_w or y2 > img_h:
         return True
     return False
 
@@ -73,15 +76,20 @@ def get_scaled_coordinates(x1, y1, x2, y2, feature, img):
 # 获取crop后的feature和image
 def get_crop(x1, y1, x2, y2, feature, img):
     # Rescale xyxy coordinates to match feature size
+    # print("feature shape: ", feature.shape) 
+    # print("img shape: ", img.shape)
+    # print("x1, y1, x2, y2: ", x1, y1, x2, y2)
     x1_scaled, y1_scaled, x2_scaled, y2_scaled = get_scaled_coordinates(x1, y1, x2, y2, feature, img)
     # Crop feature using xyxy coordinates
+    # print("x1_scaled, y1_scaled, x2_scaled, y2_scaled: ")
+    # print(x1_scaled, y1_scaled, x2_scaled, y2_scaled)
     cropped_feature = feature[:, :, int(y1_scaled):int(y2_scaled), int(x1_scaled):int(x2_scaled)]
-    feature1_resized = F.interpolate(cropped_feature, size=(65, 65), mode='bilinear', align_corners=False)
+    feature1_resized = F.interpolate(cropped_feature, size=(crop_feature_size, crop_feature_size), mode='bilinear', align_corners=False)
 
     # 裁剪图像
     cropped_img = img[:, :, int(y1):int(y2), int(x1):int(x2)]
     # print("cropped_img shape: ", cropped_img.shape)  # 裁剪的图像shape是变化的，需要resize到256*256, 但是特征图是56*56
-    cropped_img = F.interpolate(cropped_img, size=(256, 256), mode='bilinear', align_corners=False)
+    cropped_img = F.interpolate(cropped_img, size=(crop_img_size, crop_img_size), mode='bilinear', align_corners=False)
     return feature1_resized, cropped_img
 
 
@@ -91,7 +99,7 @@ def my_test(test_set, teacher, student, teacher_mean, teacher_std,
          desc='Running inference',test_output_dir=None, device="cuda"):
     y_true = []
     y_score = []
-    for path, img, im0s, vid_cap in tqdm(test_set, desc=desc):
+    for path, img, im0s, vid_cap, ratio, dw, dh  in tqdm(test_set, desc=desc):
         _, img_h, img_w = img.shape
         # process image
         img = torch.from_numpy(img).to(device)
@@ -119,13 +127,21 @@ def my_test(test_set, teacher, student, teacher_mean, teacher_std,
             class_id, x, y, width, height = annotation
             
             # 针对class_id进行判断，如果id>10, 则跳过
-            if int(class_id) not in [8,9]:
+            if int(class_id) not in [detect_class_id, detect_class_id+1]:
                 continue
             
             # 计算边界框的坐标
             x1, y1, x2, y2 = xywh2xyxy(x, y, width, height, img_w, img_h)
             # 过滤掉一些不符合要求的边界框
-            if is_ignore(x1, x2, y1, y2, threshold=h_w_threshold):
+            if is_ignore(x1, x2, y1, y2, img_w, img_h, threshold=h_w_threshold):
+                continue
+            
+            #对边框进行调整
+            boxes = [[x1, y1, x2, y2]]
+            adjust_box = adjust_boxes(boxes, ratio, dw, dh)
+            x1, y1, x2, y2 = adjust_box[0]
+            
+            if is_ignore(x1, x2, y1, y2, img_w, img_h, threshold=h_w_threshold):
                 continue
             
             # 获取crop后的feature和image
@@ -164,7 +180,7 @@ def my_map_normalization(validation_loader, teacher, student,
                       teacher_mean, teacher_std, desc='Map normalization',device="cuda"):
     
     maps_st = []
-    for path, img, im0s, vid_cap in tqdm(validation_loader, desc=desc):
+    for path, img, im0s, vid_cap, ratio, dw, dh  in tqdm(validation_loader, desc=desc):
         _, img_h, img_w = img.shape
         # process image
         img = torch.from_numpy(img).to(device)
@@ -188,12 +204,20 @@ def my_map_normalization(validation_loader, teacher, student,
             class_id, x, y, width, height = annotation
                         
             # 针对class_id进行判断，如果id>9, 则跳过
-            if int(class_id) not in [8,9]:
+            if int(class_id) not in [detect_class_id, detect_class_id+1]:
                 continue
             # 计算边界框的坐标
             x1, y1, x2, y2 = xywh2xyxy(x, y, width, height, img_w, img_h)
             # 过滤掉一些不符合要求的边界框
-            if is_ignore(x1, x2, y1, y2, threshold=h_w_threshold):
+            if is_ignore(x1, x2, y1, y2, img_w, img_h, threshold=h_w_threshold):
+                continue
+            
+            #对边框进行调整
+            boxes = [[x1, y1, x2, y2]]
+            adjust_box = adjust_boxes(boxes, ratio, dw, dh)
+            x1, y1, x2, y2 = adjust_box[0]
+                
+            if is_ignore(x1, x2, y1, y2, img_w, img_h, threshold=h_w_threshold):
                 continue
             
             # 获取crop后的feature和image
@@ -243,6 +267,28 @@ def teacher_normalization(teacher, train_loader):
     return channel_mean, channel_std
 
 
+
+def adjust_boxes(boxes, ratio, dw, dh):
+    """
+    Adjust bounding boxes to match the letterboxed image.
+    :param boxes: List of bounding boxes in the format [x1, y1, x2, y2]
+    :param ratio: Scaling ratio (width_ratio, height_ratio)
+    :param dw: Padding added to the width, divided into both sides
+    :param dh: Padding added to the height, divided into both sides
+    :return: Adjusted bounding boxes
+    """
+    adjusted_boxes = []
+    for box in boxes:
+        x1, y1, x2, y2 = box
+        x1 = x1 * ratio[0] + dw  # adjust x1 according to width ratio and padding
+        y1 = y1 * ratio[1] + dh  # adjust y1 according to height ratio and padding
+        x2 = x2 * ratio[0] + dw  # adjust x2 according to width ratio and padding
+        y2 = y2 * ratio[1] + dh  # adjust y2 according to height ratio and padding
+        adjusted_boxes.append([x1, y1, x2, y2])
+    return np.array(adjusted_boxes)
+
+
+
 def get_argparse():
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', '--dataset', default='mvtec_ad',
@@ -271,14 +317,33 @@ def get_argparse():
     parser.add_argument('--yolo_teacher_weights', default='/home/wudidi/code/yolo-distillation-AD/weights/exp13.pt', help='yolo teacher weights')
     return parser.parse_args()
 
+
+# 定义 KL 散度损失函数
+class KLDistillationLoss(nn.Module):
+    def __init__(self, temperature=1.0):
+        super(KLDistillationLoss, self).__init__()
+        self.temperature = temperature
+        self.kl_loss = nn.KLDivLoss(reduction='batchmean')
+
+    def forward(self, student_logits, teacher_logits):
+        # 计算 KL 散度损失
+        student_soft_logits = F.log_softmax(student_logits / self.temperature, dim=1)
+        teacher_soft_logits = F.softmax(teacher_logits / self.temperature, dim=1)
+        kl_loss = self.kl_loss(student_soft_logits, teacher_soft_logits) * (self.temperature ** 2)
+        return kl_loss
+
 # constants
 seed = 42
 on_gpu = torch.cuda.is_available()
 teacher_out_channels = 64
 out_channels = 384
 image_size = 256
-epochs = 10
+epochs = 100
 h_w_threshold = 32
+
+crop_img_size = 128
+crop_feature_size = 33
+detect_class_id = 6
 
 
 # data loading
@@ -342,6 +407,8 @@ def main():
     train_loader_infinite = InfiniteDataloader(train_loader)
     validation_loader = DataLoader(validation_set, batch_size=1)
 
+    # 初始化损失函数
+
     if pretrain_penalty:
         # load pretraining data for penalty
         penalty_transform = transforms.Compose([
@@ -382,9 +449,10 @@ def main():
 
     teacher_mean, teacher_std = teacher_normalization(teacher, train_loader)
 
-    optimizer = torch.optim.Adam(itertools.chain(student.parameters(),    # 同时更新两个模型参数
-                                                 autoencoder.parameters()),
-                                 lr=1e-4, weight_decay=1e-5)
+    # optimizer = torch.optim.Adam(itertools.chain(student.parameters(),    # 同时更新两个模型参数
+    #                                              autoencoder.parameters()),
+    #                              lr=1e-4, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(student.parameters(), lr=0.001)  # 示例代码，需替换为实际优化器
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=int(0.95 * config.train_steps), gamma=0.1)
     tqdm_obj = tqdm(range(config.train_steps))
@@ -398,6 +466,8 @@ def main():
     teacher_yolo = attempt_load(w, map_location=device)
     # 转为eval模式
     teacher_yolo.eval()
+    
+    distillation_loss_fn = KLDistillationLoss(temperature=3.0)
     # 获取类别名称
     names = teacher_yolo.module.names if hasattr(teacher_yolo, 'module') else teacher_yolo.names  # get class names
     print("names: ", names)
@@ -406,17 +476,17 @@ def main():
     #  'cabinet_good', 'cabinet_bad', 'backpack-box_good', 'backpack-box_bad', 'off-site', 'Gun-type-Camera', 
     #  'Dome-Camera', 'Flashlight', 'b-Flashlight']
     # 加载数据集    
-    source = '/home/wudidi/code/yolo-distillation-AD/datasets/hefei_yolo_format_v2.4/train/images/backpack-box_good*.jpg'
+    source = '/home/wudidi/code/yolo-distillation-AD/datasets/hefei_yolo_format_v2.4/train/images/cabinet_good*.jpg'
     imgsz=[1280,1280]
     stride = int(teacher_yolo.stride.max())  # model stride
-    dataset = LoadImages(source, img_size=imgsz, stride=stride)
+    dataset = LoadImagesForAD(source, img_size=imgsz, stride=stride)
     
-    val_source = '/home/wudidi/code/yolo-distillation-AD/datasets/hefei_yolo_format_v2.4/val/images/backpack-box_*.jpg'
-    val_dataset = LoadImages(val_source, img_size=imgsz, stride=stride)
+    val_source = '/home/wudidi/code/yolo-distillation-AD/datasets/hefei_yolo_format_v2.4/val/images/cabinet*.jpg'
+    val_dataset = LoadImagesForAD(val_source, img_size=imgsz, stride=stride)
     for epoch in range(epochs):
         print("================= Start Training Epoch:{} ================== ".format(epoch))
         tqdm_obj = tqdm(range(len(dataset)))
-        for iteration, (path, img, im0s, vid_cap) in zip(tqdm_obj, dataset):
+        for iteration, (path, img, im0s, vid_cap, ratio, dw, dh ) in zip(tqdm_obj, dataset):
             # print(path) # /data/hefei-dataset/hefei_yolo_format_v2.0/train/images/backpack-box_bad_1.jpg            
             _, img_h, img_w = img.shape
             # process image
@@ -442,16 +512,24 @@ def main():
                 
                 
                 # 针对class_id进行判断，如果id>10, 则跳过
-                if int(class_id) != 8:
+                if int(class_id) != detect_class_id:
                     # print("class_id: ", class_id)
                     continue
                 
                 # 计算边界框的坐标
                 x1, y1, x2, y2 = xywh2xyxy(x, y, width, height, img_w, img_h)
                 # 过滤掉一些不符合要求的边界框
-                if is_ignore(x1, x2, y1, y2, threshold=h_w_threshold):
+                if is_ignore(x1, x2, y1, y2,img_w, img_h, threshold=h_w_threshold):
                     continue
                 
+                #对边框进行调整
+                boxes = [[x1, y1, x2, y2]]
+                adjust_box = adjust_boxes(boxes, ratio, dw, dh)
+                x1, y1, x2, y2 = adjust_box[0]
+
+                if is_ignore(x1, x2, y1, y2, img_w, img_h, threshold=h_w_threshold):
+                    continue
+
                 # 获取crop后的feature和image
                 cropped_feature, cropped_img = get_crop(x1, y1, x2, y2, feature, img)
                 # print("cropped_feature shape: ", cropped_feature.shape)  # torch.Size([1, 384, 56, 56])
@@ -461,11 +539,16 @@ def main():
                 
                 # 开始训练学生模型
                 student_output_st = student(cropped_img)[:, :teacher_out_channels]  #  torch.Size([1, 768, 56, 56])
-                # print("student_output_st shape: ", student_output_st.shape)
+
                 distance_st = (teacher_output_st - student_output_st) ** 2
                 d_hard = torch.quantile(distance_st, q=0.999)
                 loss_hard = torch.mean(distance_st[distance_st >= d_hard])
-                loss_total = loss_hard
+                
+                
+                # 计算知识蒸馏损失
+                kd_loss = distillation_loss_fn(student_output_st, teacher_output_st)
+                
+                loss_total = loss_hard + kd_loss
                 optimizer.zero_grad()
                 loss_total.backward()
                 optimizer.step()

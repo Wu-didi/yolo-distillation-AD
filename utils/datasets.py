@@ -236,6 +236,48 @@ class LoadImages:
     def __len__(self):
         return self.nf  # number of files
 
+# 继承Loadimages类，增加输出letterbox ratio和dw,dh
+class LoadImagesForAD(LoadImages):
+    '''无监督缺陷检测专用'''
+    def __next__(self):
+        if self.count == self.nf:
+            raise StopIteration
+        path = self.files[self.count]
+
+        if self.video_flag[self.count]:
+            # Read video
+            self.mode = 'video'
+            ret_val, img0 = self.cap.read()
+            if not ret_val:
+                self.count += 1
+                self.cap.release()
+                if self.count == self.nf:  # last video
+                    raise StopIteration
+                else:
+                    path = self.files[self.count]
+                    self.new_video(path)
+                    ret_val, img0 = self.cap.read()
+
+            self.frame += 1
+            print(f'video {self.count + 1}/{self.nf} ({self.frame}/{self.frames}) {path}: ', end='')
+
+        else:
+            # Read image
+            self.count += 1
+            img0 = cv2.imread(path)  # BGR
+            assert img0 is not None, 'Image Not Found ' + path
+            # print(f'image {self.count}/{self.nf} {path}: ', end='')
+
+        # Padded resize
+        img, ratio, (dw, dh) = letterbox(img0, self.img_size, stride=self.stride, auto=self.auto)
+
+        # Convert
+        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img = np.ascontiguousarray(img)
+
+        return path, img, img0, self.cap, ratio, dw, dh
+    
+
 
 class LoadWebcam:  # for inference
     # YOLOv5 local webcam dataloader, i.e. `python detect.py --source 0`

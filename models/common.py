@@ -23,6 +23,9 @@ from utils.general import colorstr, increment_path, make_divisible, non_max_supp
 from utils.plots import Annotator, colors
 from utils.torch_utils import time_sync
 
+import torch.nn.functional as F
+from torch.distributions.normal import Normal
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -135,6 +138,64 @@ class C3(nn.Module):
 
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
+    
+    
+    
+class ProbabilisticAttention(nn.Module):
+    def __init__(self, d_model, num_samples=5):
+        super(ProbabilisticAttention, self).__init__()
+        self.query_conv = nn.Conv2d(d_model, d_model, kernel_size=1)
+        self.key_conv = nn.Conv2d(d_model, d_model, kernel_size=1)
+        self.value_conv = nn.Conv2d(d_model, d_model, kernel_size=1)
+        
+        # Convolutional layers for mean and std deviation
+        self.mean_conv = nn.Conv2d(d_model, d_model, kernel_size=1)
+        self.std_conv = nn.Conv2d(d_model, d_model, kernel_size=1)
+        
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(d_model)
+        
+        # Scaled dot-product attention factor
+        self.scale = d_model ** 0.5
+        
+        # Number of samples for averaging
+        self.num_samples = num_samples
+
+    def forward(self, queries, keys, values):
+        # Convolutional projections
+        q = self.query_conv(queries)
+        k = self.key_conv(keys)
+        v = self.value_conv(values)
+
+        # Calculate mean and standard deviation
+        mean = self.mean_conv(q - k)
+        std = F.softplus(self.std_conv(q - k))  # Ensure non-negative std deviation
+        
+        # Sample attention weights from Gaussian distribution and average
+        attention_weights = 0
+        for _ in range(self.num_samples):
+            eps = torch.randn_like(std)
+            sampled_attention_weights = mean + eps * std
+            attention_weights += sampled_attention_weights / self.num_samples
+
+        # Reshape for matrix multiplication
+        bs, c, h, w = attention_weights.shape
+        attention_weights = attention_weights.view(bs, c, -1)
+        k = k.view(bs, c, -1)
+        v = v.view(bs, c, -1)
+
+        # Scaled dot-product attention
+        attention_scores = torch.matmul(attention_weights.permute(0, 2, 1), k) / self.scale
+        attention_scores = F.softmax(attention_scores, dim=-1)
+
+        # Calculate attention output
+        attention_output = torch.matmul(attention_scores, v.permute(0, 2, 1))
+        attention_output = attention_output.permute(0, 2, 1).view(bs, c, h, w)
+        
+        # Apply layer normalization
+        attention_output = self.layer_norm(attention_output.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+        return attention_output
 
 class C3_print(nn.Module):
     # CSP Bottleneck with 3 convolutions
@@ -151,6 +212,24 @@ class C3_print(nn.Module):
         result = self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
         # print(result.shape)
         return result
+
+
+class C3_pro(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # act=FReLU(c2)
+        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        # self.m = nn.Sequential(*[CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)])
+        self.pro = ProbabilisticAttention(c2)
+        
+
+    def forward(self, x):
+        x = self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
+        return  self.pro(x, x, x)
 
 
 class C3TR(C3):
